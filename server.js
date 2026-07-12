@@ -25,82 +25,81 @@ app.get("/", (req, res) => {
 
 app.get("/quote", async (req, res) => {
     try {
-        const { tokenIn, tokenOut, amountIn } = req.query;
+        const tokenIn = req.query.tokenIn;
+        const tokenOut = req.query.tokenOut;
+        const amountIn = req.query.amountIn;
 
         if (!tokenIn || !tokenOut || !amountIn) {
             return res.status(400).json({
                 success: false,
-                error: "Missing parameters: tokenIn, tokenOut, amountIn"
+                error: "Missing parameters"
             });
         }
 
-        // Validate amountIn is a valid number before converting to BigInt
+        // Validate amountIn
         if (isNaN(amountIn) || BigInt(amountIn) <= 0n) {
             return res.status(400).json({
                 success: false,
-                error: "Invalid amountIn. Must be a positive number."
+                error: "Invalid amountIn"
             });
         }
 
         const path = [tokenIn, tokenOut];
-
         const amounts = await router.getAmountsOut(BigInt(amountIn), path);
 
-        // Ensure it's treated as a BigInt (in case your provider returns strings)
         const buyAmount = BigInt(amounts[1]).toString();
 
         res.json({
             success: true,
             buyAmount: buyAmount,
-            minBuyAmount: buyAmount, 
+            minBuyAmount: buyAmount,
             to: process.env.ROUTER_ADDRESS,
             data: "0x",
-            value: "0"
+            value: "0",
+            // Add this for ERC20 token approvals
+            allowanceTarget: process.env.ROUTER_ADDRESS
         });
 
     } catch (err) {
         console.error("Quote error:", err);
-        // Return proper 500 status code on server errors
         res.status(500).json({
             success: false,
-            error: err.message || "Internal server error"
+            error: err.message
         });
     }
 });
 
 app.get("/swap", async (req, res) => {
     try {
-        const { sellToken, buyToken, sellAmount, taker } = req.query;
+        const sellToken = req.query.sellToken;
+        const buyToken = req.query.buyToken;
+        const amountIn = req.query.sellAmount;
+        const account = req.query.taker;
 
-        // Added 'taker' to the validation check
-        if (!sellToken || !buyToken || !sellAmount || !taker) {
+        if (!sellToken || !buyToken || !amountIn || !account) {
             return res.status(400).json({
                 success: false,
-                error: "Missing parameters: sellToken, buyToken, sellAmount, taker"
+                error: "Missing parameters"
             });
         }
 
-        if (isNaN(sellAmount) || BigInt(sellAmount) <= 0n) {
+        if (isNaN(amountIn) || BigInt(amountIn) <= 0n) {
             return res.status(400).json({
                 success: false,
-                error: "Invalid sellAmount. Must be a positive number."
+                error: "Invalid amount"
             });
         }
 
-        const deadline = Math.floor(Date.now() / 1000) + 60 * 20; // 20 minutes
+        const deadline = Math.floor(Date.now() / 1000) + 60 * 20;
         const path = [sellToken, buyToken];
-
-        const amounts = await router.getAmountsOut(BigInt(sellAmount), path);
-
-        // Calculate minOut with 0.5% slippage (99.5%)
-        const amountOut = BigInt(amounts[1]);
-        const minOut = (amountOut * 995n) / 1000n;
+        const amounts = await router.getAmountsOut(BigInt(amountIn), path);
+        const minOut = (BigInt(amounts[1]) * 995n) / 1000n;
 
         const data = iface.encodeFunctionData("swapExactTokensForTokens", [
-            BigInt(sellAmount),
+            BigInt(amountIn),
             minOut,
             path,
-            taker,
+            account,
             deadline
         ]);
 
@@ -109,15 +108,16 @@ app.get("/swap", async (req, res) => {
             to: process.env.ROUTER_ADDRESS,
             data: data,
             value: "0",
-            buyAmount: amountOut.toString(),
-            minBuyAmount: minOut.toString()
+            buyAmount: amounts[1].toString(),
+            minBuyAmount: minOut.toString(),
+            allowanceTarget: process.env.ROUTER_ADDRESS // Add this
         });
 
     } catch (e) {
         console.error("Swap error:", e);
         res.status(500).json({
             success: false,
-            error: e.message || "Internal server error"
+            error: e.message
         });
     }
 });
