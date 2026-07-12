@@ -3,69 +3,94 @@ const cors = require("cors");
 require("dotenv").config();
 
 const { ethers } = require("ethers");
-const routerAbi = require("./abi/AWERouter.json");
-const { router } = require("./config/router"); // Ensure this exports an ethers v6 Contract instance
+const feeRouterAbi = require("./abi/AWEFeeRouter.json");
+const { feeRouter, getWbnbAddress } = require("./config/router");
 
-// Ethers v6 Interface
-const iface = new ethers.Interface(routerAbi);
+const iface = new ethers.Interface(feeRouterAbi);
 
 const app = express();
 
-// 1. Clean CORS setup (Removed the duplicate manual middleware)
 app.use(cors({
     origin: true,
     credentials: false
 }));
 
-app.options("*", cors());
+app.use(express.json());
+
+const NATIVE = "BNB";
+const isNative = (addr) => typeof addr === "string" && addr.toUpperCase() === NATIVE;
+
+async function resolvePath(tokenIn, tokenOut) {
+    const wbnb = await getWbnbAddress();
+    const from = isNative(tokenIn) ? wbnb : tokenIn;
+    const to = isNative(tokenOut) ? wbnb : tokenOut;
+    return [from, to];
+}
 
 app.get("/", (req, res) => {
-    res.send("AppsWebStore API");
+    res.send("AWE DEX API — own quotes, own swaps, own fee collection. No third-party aggregator involved.");
+});
+
+app.get("/health", async (req, res) => {
+    try {
+        const [owner, treasury, feeBps, routerAddr] = await Promise.all([
+            feeRouter.owner(),
+            feeRouter.treasury(),
+            feeRouter.feeBps(),
+            feeRouter.router()
+        ]);
+        res.json({
+            success: true,
+            feeRouter: await feeRouter.getAddress(),
+            underlyingRouter: routerAddr,
+            owner,
+            treasury,
+            feeBps: feeBps.toString()
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
 });
 
 app.get("/quote", async (req, res) => {
     try {
-        const tokenIn = req.query.tokenIn;
-        const tokenOut = req.query.tokenOut;
-        const amountIn = req.query.amountIn;
+        const { tokenIn, tokenOut, amountIn } = req.query;
 
         if (!tokenIn || !tokenOut || !amountIn) {
-            return res.status(400).json({
-                success: false,
-                error: "Missing parameters"
-            });
+            return res.status(400).json({ success: false, error: "Missing parameters" });
         }
-
-        // Validate amountIn
         if (isNaN(amountIn) || BigInt(amountIn) <= 0n) {
-            return res.status(400).json({
-                success: false,
-                error: "Invalid amountIn"
-            });
+            return res.status(400).json({ success: false, error: "Invalid amountIn" });
         }
 
-        const path = [tokenIn, tokenOut];
-        const amounts = await router.getAmountsOut(BigInt(amountIn), path);
+        const path = await resolvePath(tokenIn, tokenOut);
+        if (path[0].toLowerCase() === path[1].toLowerCase()) {
+            return res.status(400).json({ success: false, error: "tokenIn and tokenOut must differ" });
+        }
 
-        const buyAmount = BigInt(amounts[1]).toString();
+        const [fee, amountInAfterFee, amounts] = await feeRouter.getAmountsOutWithFee(BigInt(amountIn), path);
+        const buyAmount = amounts[amounts.length - 1].toString();
+        const feeBps = await feeRouter.feeBps();
+        const feeRouterAddress = await feeRouter.getAddress();
 
         res.json({
             success: true,
-            buyAmount: buyAmount,
+            sellToken: tokenIn,
+            buyToken: tokenOut,
+            sellAmount: amountIn.toString(),
+            buyAmount,
             minBuyAmount: buyAmount,
-            to: process.env.ROUTER_ADDRESS,
+            fee: fee.toString(),
+            feeBps: feeBps.toString(),
+            amountInAfterFee: amountInAfterFee.toString(),
+            to: feeRouterAddress,
             data: "0x",
-            value: "0",
-            // Add this for ERC20 token approvals
-            allowanceTarget: process.env.ROUTER_ADDRESS
+            value: isNative(tokenIn) ? amountIn.toString() : "0",
+            allowanceTarget: isNative(tokenIn) ? null : feeRouterAddress
         });
-
     } catch (err) {
         console.error("Quote error:", err);
-        res.status(500).json({
-            success: false,
-            error: err.message
-        });
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 
@@ -75,54 +100,65 @@ app.get("/swap", async (req, res) => {
         const buyToken = req.query.buyToken;
         const amountIn = req.query.sellAmount;
         const account = req.query.taker;
+        const slippageBps = req.query.slippageBps ? BigInt(req.query.slippageBps) : 50n;
 
         if (!sellToken || !buyToken || !amountIn || !account) {
-            return res.status(400).json({
-                success: false,
-                error: "Missing parameters"
-            });
+            return res.status(400).json({ success: false, error: "Missing parameters" });
         }
-
         if (isNaN(amountIn) || BigInt(amountIn) <= 0n) {
-            return res.status(400).json({
-                success: false,
-                error: "Invalid amount"
-            });
+            return res.status(400).json({ success: false, error: "Invalid amount" });
+        }
+        if (!ethers.isAddress(account)) {
+            return res.status(400).json({ success: false, error: "Invalid taker address" });
+        }
+        if (slippageBps < 0n || slippageBps > 5000n) {
+            return res.status(400).json({ success: false, error: "slippageBps must be between 0 and 5000" });
         }
 
+        const path = await resolvePath(sellToken, buyToken);
         const deadline = Math.floor(Date.now() / 1000) + 60 * 20;
-        const path = [sellToken, buyToken];
-        const amounts = await router.getAmountsOut(BigInt(amountIn), path);
-        const minOut = (BigInt(amounts[1]) * 995n) / 1000n;
 
-        const data = iface.encodeFunctionData("swapExactTokensForTokens", [
-            BigInt(amountIn),
-            minOut,
-            path,
-            account,
-            deadline
-        ]);
+        const [fee, , amounts] = await feeRouter.getAmountsOutWithFee(BigInt(amountIn), path);
+        const buyAmount = amounts[amounts.length - 1];
+        const minOut = (buyAmount * (10000n - slippageBps)) / 10000n;
+
+        const sellingNative = isNative(sellToken);
+        const buyingNative = isNative(buyToken);
+        const feeRouterAddress = await feeRouter.getAddress();
+
+        let data;
+        let value = "0";
+
+        if (sellingNative) {
+            data = iface.encodeFunctionData("swapExactETHForTokensWithFee", [minOut, path, account, deadline]);
+            value = amountIn.toString();
+        } else if (buyingNative) {
+            data = iface.encodeFunctionData("swapExactTokensForETHWithFee", [
+                BigInt(amountIn), minOut, path, account, deadline
+            ]);
+        } else {
+            data = iface.encodeFunctionData("swapExactTokensForTokensWithFee", [
+                BigInt(amountIn), minOut, path, account, deadline
+            ]);
+        }
 
         res.json({
             success: true,
-            to: process.env.ROUTER_ADDRESS,
-            data: data,
-            value: "0",
-            buyAmount: amounts[1].toString(),
+            to: feeRouterAddress,
+            data,
+            value,
+            buyAmount: buyAmount.toString(),
             minBuyAmount: minOut.toString(),
-            allowanceTarget: process.env.ROUTER_ADDRESS // Add this
+            fee: fee.toString(),
+            allowanceTarget: sellingNative ? null : feeRouterAddress
         });
-
     } catch (e) {
         console.error("Swap error:", e);
-        res.status(500).json({
-            success: false,
-            error: e.message
-        });
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`API running on port ${PORT}...`);
+    console.log(`AWE DEX API running on port ${PORT}`);
 });
