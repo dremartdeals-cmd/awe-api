@@ -1,4 +1,5 @@
 const express = require("express");
+const cors = require("cors");
 require("dotenv").config();
 
 const { ethers } = require("ethers");
@@ -8,7 +9,14 @@ const { router } = require("./config/router");
 const iface = new ethers.Interface(routerAbi);
 
 const app = express();
+app.use(cors());
 
+app.use((req, res, next) => {
+    res.header("Access-Control-Allow-Origin", "*");
+    res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    next();
+});
 app.get("/", (req, res) => {
     res.send("AppsWebStore API");
 });
