@@ -4,117 +4,125 @@ require("dotenv").config();
 
 const { ethers } = require("ethers");
 const routerAbi = require("./abi/AWERouter.json");
-const { router } = require("./config/router");
+const { router } = require("./config/router"); // Ensure this exports an ethers v6 Contract instance
 
+// Ethers v6 Interface
 const iface = new ethers.Interface(routerAbi);
 
 const app = express();
-app.use(cors());
+
+// 1. Clean CORS setup (Removed the duplicate manual middleware)
+app.use(cors({
+    origin: true,
+    credentials: false
+}));
+
 app.options("*", cors());
 
-app.use((req, res, next) => {
-    res.header("Access-Control-Allow-Origin", "*");
-    res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-    res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    next();
-});
 app.get("/", (req, res) => {
     res.send("AppsWebStore API");
 });
 
 app.get("/quote", async (req, res) => {
-
     try {
-
-        const tokenIn = req.query.tokenIn;
-        const tokenOut = req.query.tokenOut;
-        const amountIn = req.query.amountIn;
+        const { tokenIn, tokenOut, amountIn } = req.query;
 
         if (!tokenIn || !tokenOut || !amountIn) {
-            return res.json({
+            return res.status(400).json({
                 success: false,
-                error: "Missing parameters"
+                error: "Missing parameters: tokenIn, tokenOut, amountIn"
+            });
+        }
+
+        // Validate amountIn is a valid number before converting to BigInt
+        if (isNaN(amountIn) || BigInt(amountIn) <= 0n) {
+            return res.status(400).json({
+                success: false,
+                error: "Invalid amountIn. Must be a positive number."
             });
         }
 
         const path = [tokenIn, tokenOut];
 
-        const amounts = await router.getAmountsOut(
-            BigInt(amountIn),
-            path
-        );
+        const amounts = await router.getAmountsOut(BigInt(amountIn), path);
 
-res.json({
-    success: true,
-    buyAmount: amounts[1].toString(),
-    minBuyAmount: amounts[1].toString(),
-    to: process.env.ROUTER_ADDRESS,
-    data: "0x",
-    value: "0"
-});
-
-    } catch (err) {
+        // Ensure it's treated as a BigInt (in case your provider returns strings)
+        const buyAmount = BigInt(amounts[1]).toString();
 
         res.json({
-            success: false,
-            error: err.message
+            success: true,
+            buyAmount: buyAmount,
+            minBuyAmount: buyAmount, 
+            to: process.env.ROUTER_ADDRESS,
+            data: "0x",
+            value: "0"
         });
 
+    } catch (err) {
+        console.error("Quote error:", err);
+        // Return proper 500 status code on server errors
+        res.status(500).json({
+            success: false,
+            error: err.message || "Internal server error"
+        });
     }
-
 });
 
 app.get("/swap", async (req, res) => {
-
     try {
+        const { sellToken, buyToken, sellAmount, taker } = req.query;
 
-const sellToken = req.query.sellToken;
-const buyToken = req.query.buyToken;
-const amountIn = req.query.sellAmount;
-const account = req.query.taker;
+        // Added 'taker' to the validation check
+        if (!sellToken || !buyToken || !sellAmount || !taker) {
+            return res.status(400).json({
+                success: false,
+                error: "Missing parameters: sellToken, buyToken, sellAmount, taker"
+            });
+        }
 
-        const deadline = Math.floor(Date.now() / 1000) + 60 * 20;
+        if (isNaN(sellAmount) || BigInt(sellAmount) <= 0n) {
+            return res.status(400).json({
+                success: false,
+                error: "Invalid sellAmount. Must be a positive number."
+            });
+        }
 
+        const deadline = Math.floor(Date.now() / 1000) + 60 * 20; // 20 minutes
         const path = [sellToken, buyToken];
 
-        const amounts = await router.getAmountsOut(
-            BigInt(amountIn),
-            path
-        );
+        const amounts = await router.getAmountsOut(BigInt(sellAmount), path);
 
-        const minOut = amounts[1] * 995n / 1000n;
+        // Calculate minOut with 0.5% slippage (99.5%)
+        const amountOut = BigInt(amounts[1]);
+        const minOut = (amountOut * 995n) / 1000n;
 
-        const data = iface.encodeFunctionData(
-            "swapExactTokensForTokens",
-            [
-                BigInt(amountIn),
-                minOut,
-                path,
-                account,
-                deadline
-            ]
-        );
+        const data = iface.encodeFunctionData("swapExactTokensForTokens", [
+            BigInt(sellAmount),
+            minOut,
+            path,
+            taker,
+            deadline
+        ]);
 
         res.json({
             success: true,
             to: process.env.ROUTER_ADDRESS,
-            data,
+            data: data,
             value: "0",
-            buyAmount: amounts[1].toString(),
+            buyAmount: amountOut.toString(),
             minBuyAmount: minOut.toString()
         });
 
     } catch (e) {
-
-        res.json({
+        console.error("Swap error:", e);
+        res.status(500).json({
             success: false,
-            error: e.message
+            error: e.message || "Internal server error"
         });
-
     }
-
 });
 
-app.listen(3000, () => {
-    console.log("API running...");
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`API running on port ${PORT}...`);
 });
