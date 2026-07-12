@@ -10,6 +10,7 @@ const iface = new ethers.Interface(routerAbi);
 
 const app = express();
 app.use(cors());
+app.options("*", cors());
 
 app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
